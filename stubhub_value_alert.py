@@ -19,7 +19,6 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 def redact_url(u: str) -> str:
-    # keep it readable but avoid dumping huge query strings
     if "?" in u:
         return u.split("?")[0] + "?…"
     return u
@@ -42,10 +41,10 @@ EVENT_URL = os.getenv("STUBHUB_EVENT_URL", "").strip()
 MIN_VALUE_SCORE = float(os.getenv("MIN_VALUE_SCORE", "9.5"))
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 
-# Enforce quantity (e.g., "2 tickets")
+# Enforce quantity (e.g., 2 tickets)
 MIN_TICKETS = int(os.getenv("MIN_TICKETS", "2"))
 
-# Digest settings (cumulative snapshot)
+# Digest settings
 DIGEST_INTERVAL_SECONDS = int(os.getenv("DIGEST_INTERVAL_SECONDS", "3600"))
 DIGEST_TOP_N = int(os.getenv("DIGEST_TOP_N", "15"))
 
@@ -55,13 +54,14 @@ PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN", "").strip()
 
 STATE_FILE = os.getenv("STATE_FILE", "seen_listings.json")
 
-# Optional fallback: if numeric scores not visible, trigger on deal labels
+# Optional fallback if numeric scores not visible:
+# Example: "best deal,great deal,amazing deal"
 DEAL_LABELS_TRIGGER = [s.strip().lower() for s in os.getenv("DEAL_LABELS_TRIGGER", "").split(",") if s.strip()]
 
 # Debug controls
-DEBUG_DUMP_HTML_ON_EMPTY = os.getenv("DEBUG_DUMP_HTML_ON_EMPTY", "1") == "1"
-DEBUG_PRINT_SAMPLE_TEXTS = int(os.getenv("DEBUG_PRINT_SAMPLE_TEXTS", "3"))  # print N sample card texts
-DEBUG_MAX_SAMPLE_CHARS = int(os.getenv("DEBUG_MAX_SAMPLE_CHARS", "600"))
+DEBUG_DUMP_HTML_ON_FAILURE = os.getenv("DEBUG_DUMP_HTML_ON_FAILURE", "1") == "1"
+DEBUG_PRINT_SAMPLE_BLOCKS = int(os.getenv("DEBUG_PRINT_SAMPLE_BLOCKS", "3"))
+DEBUG_MAX_SAMPLE_CHARS = int(os.getenv("DEBUG_MAX_SAMPLE_CHARS", "700"))
 
 # Heartbeat
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "10"))
@@ -131,7 +131,10 @@ def pushover_notify(title: str, message: str) -> None:
 # =========================
 
 def extract_value_score(text: str) -> Optional[float]:
-    # Only accept numbers tied to deal/value score wording; prevents "2 tickets" etc.
+    """
+    Only accept numbers explicitly tied to deal/value score wording.
+    Avoids false positives like '2 tickets' or '$73'.
+    """
     m = re.search(r"(deal|value)\s*(score)?\s*[:\-]?\s*(\d+(\.\d+)?)", text, re.IGNORECASE)
     if m:
         try:
@@ -141,7 +144,15 @@ def extract_value_score(text: str) -> Optional[float]:
     return None
 
 def extract_deal_label(text: str) -> Optional[str]:
-    labels = ["great deal", "amazing deal", "good deal", "best value", "good value", "fair deal"]
+    labels = [
+        "best deal",
+        "great deal",
+        "amazing deal",
+        "good deal",
+        "best value",
+        "good value",
+        "fair deal",
+    ]
     low = text.lower()
     for lab in labels:
         if lab in low:
@@ -155,7 +166,6 @@ def extract_qty(text: str) -> int:
             return int(m.group(1))
         except Exception:
             return 0
-    # Some cards say "Quantity 2" or "Qty 2"
     m = re.search(r"\b(qty|quantity)\b\D{0,6}(\d+)", text, re.IGNORECASE)
     if m:
         try:
@@ -194,28 +204,24 @@ def format_listing(l: Listing) -> str:
     fees = f" | {l.fees_or_all_in}" if l.fees_or_all_in else ""
     return f"Score {score}{label} | {l.section}/{l.row} | Qty {l.qty} | {l.price}{fees}"
 
-def detect_interstitial_flags(html: str) -> List[str]:
+def detect_flags(html: str) -> List[str]:
     flags = [
         "captcha",
         "verify you are human",
-        "robot",
+        "unusual traffic",
         "access denied",
         "cloudflare",
         "consent",
         "cookie",
-        "enable javascript",
-        "blocked",
-        "unusual traffic",
     ]
     low = html.lower()
     return [f for f in flags if f in low]
 
 # =========================
-# Browser helpers
+# Browser / DOM helpers
 # =========================
 
 def try_click_consent(page) -> None:
-    # Try several patterns without failing the run if absent
     patterns = [
         re.compile(r"accept|agree|i agree|allow all|got it", re.I),
         re.compile(r"continue", re.I),
@@ -224,7 +230,7 @@ def try_click_consent(page) -> None:
         try:
             btn = page.get_by_role("button", name=pat)
             if btn.count() > 0:
-                btn.first.click(timeout=2000)
+                btn.first.click(timeout=2500)
                 page.wait_for_timeout(1200)
                 log("[debug] clicked consent button")
                 return
@@ -232,50 +238,84 @@ def try_click_consent(page) -> None:
             pass
 
 def scroll_aggressively(page) -> None:
+    # Force virtualized results to mount
     for _ in range(12):
         page.mouse.wheel(0, 1500)
         page.wait_for_timeout(800)
     page.mouse.wheel(0, -99999)
     page.wait_for_timeout(900)
 
-def choose_best_selector(page) -> Optional[str]:
-    selectors = [
-        "li[data-testid*='listing']",
-        "div[data-testid*='listing']",
-        "[data-testid*='listing']",
-        "li:has-text('Section')",
-        "div:has-text('Section')",
-        "li:has-text('$')",
-        "div:has-text('$')",
-    ]
-    best_sel = None
-    best_count = 0
-    for s in selectors:
-        try:
-            c = page.locator(s).count()
-            log(f"[debug] selector probe: {s} -> {c}")
-            if c > best_count:
-                best_sel = s
-                best_count = c
-        except Exception as e:
-            log(f"[debug] selector probe error: {s} -> {e}")
-    return best_sel if best_count > 0 else None
+def find_results_root(page):
+    """
+    Anchor to 'View <N> Listings' and climb to a container that likely holds results.
+    """
+    anchor = page.locator("text=/View\\s+\\d+\\s+Listings/i").first
+    if anchor.count() == 0:
+        return None
 
-def extract_text_blocks(page, selector: str, max_cards: int = 80) -> List[str]:
-    loc = page.locator(selector)
-    count = loc.count()
-    n = min(count, max_cards)
+    # Climb to a container. We try a few ancestor depths to be robust.
+    # Using XPath to find a reasonable DIV/MAIN ancestor.
+    for depth in range(1, 8):
+        try:
+            cand = anchor.locator(f"xpath=ancestor::*[{depth}]")
+            if cand.count() > 0:
+                # sanity: does this ancestor contain multiple "Section" tokens?
+                sec_count = cand.locator("text=/\\bSection\\b/i").count()
+                if sec_count >= 5:
+                    log(f"[debug] results root found at ancestor depth {depth} (Section tokens={sec_count})")
+                    return cand
+        except Exception:
+            continue
+
+    # fallback: closest div/main
+    fallback = anchor.locator("xpath=ancestor-or-self::*[self::div or self::main][1]")
+    return fallback if fallback.count() > 0 else None
+
+def extract_listing_blocks_from_root(root, max_blocks=300) -> List[str]:
+    """
+    Extract candidate blocks that look like real listing rows/cards.
+    Hard gating eliminates filters and seat map.
+    """
+    candidates = root.locator("div, li").filter(has_text=re.compile(r"\bSection\b", re.I))
+    total = candidates.count()
+    log(f"[debug] candidates in results root: {total}")
+
     texts: List[str] = []
+    n = min(total, max_blocks)
     for i in range(n):
         try:
-            t = loc.nth(i).inner_text(timeout=2500).strip()
-            if t:
-                texts.append(t)
+            t = candidates.nth(i).inner_text(timeout=2200).strip()
+            if not t:
+                continue
+
+            low = t.lower()
+
+            # Hard gates for real listing-like content
+            must_have = ("section" in low) and ("row" in low) and ("ticket" in low) and ("$" in t)
+            if not must_have:
+                continue
+
+            # Exclude obvious filter panels (these contain huge lists like "Number of tickets Any 1 ticket 2 tickets...")
+            if "number of tickets" in low and "reset filters" in low:
+                continue
+
+            # Exclude seat-map section index blobs (tons of bare numbers / "FLR 1 FLR 7...")
+            if re.search(r"\bFLR\b", t) and len(t) > 800:
+                continue
+
+            texts.append(t)
         except PlaywrightTimeoutError:
             continue
         except Exception:
             continue
+
     return texts
+
+def summarize_text_for_log(t: str) -> str:
+    s = re.sub(r"\s+", " ", t).strip()
+    if len(s) > DEBUG_MAX_SAMPLE_CHARS:
+        s = s[:DEBUG_MAX_SAMPLE_CHARS] + "…"
+    return s
 
 # =========================
 # Scrape
@@ -306,58 +346,41 @@ def scrape_listings(event_url: str) -> List[Listing]:
             log(f"[debug] title -> {page.title()}")
         except Exception:
             log("[debug] title -> (unavailable)")
-
         log(f"[debug] final url -> {redact_url(page.url)}")
 
         html = page.content()
         log(f"[debug] html size -> {len(html)}")
-        flags = detect_interstitial_flags(html)
-        log(f"[debug] interstitial flags -> {flags}")
+        flags = detect_flags(html)
+        log(f"[debug] flags -> {flags}")
 
         try_click_consent(page)
-
-        # Render/virtualization triggers
         scroll_aggressively(page)
         page.wait_for_timeout(1200)
 
-        best_sel = choose_best_selector(page)
-        if not best_sel:
-            log("[error] no selector matched listing cards (count=0 for all probes).")
-            if DEBUG_DUMP_HTML_ON_EMPTY:
-                write_debug_file("/tmp/stubhub_debug_no_selector.html", html[:2_000_000])
+        root = find_results_root(page)
+        if not root:
+            log("[error] could not locate results root (missing 'View N Listings' anchor).")
+            if DEBUG_DUMP_HTML_ON_FAILURE:
+                write_debug_file("/tmp/stubhub_debug_no_results_root.html", html[:2_000_000])
             browser.close()
             return listings
 
-        texts = extract_text_blocks(page, best_sel, max_cards=120)
-        log(f"[debug] extracted text blocks -> {len(texts)}")
+        texts = extract_listing_blocks_from_root(root, max_blocks=350)
+        log(f"[debug] listing-like blocks extracted -> {len(texts)}")
 
-        if len(texts) < 3:
-            log("[warn] low extracted count; retrying with additional scroll.")
-            scroll_aggressively(page)
-            page.wait_for_timeout(1200)
-            texts = extract_text_blocks(page, best_sel, max_cards=180)
-            log(f"[debug] re-extracted text blocks -> {len(texts)}")
+        if DEBUG_PRINT_SAMPLE_BLOCKS > 0:
+            for i, t in enumerate(texts[:DEBUG_PRINT_SAMPLE_BLOCKS], start=1):
+                log(f"[debug] sample LISTING block {i}: {summarize_text_for_log(t)}")
 
-        if DEBUG_PRINT_SAMPLE_TEXTS > 0:
-            for i, t in enumerate(texts[:DEBUG_PRINT_SAMPLE_TEXTS], start=1):
-                sample = re.sub(r"\s+", " ", t).strip()
-                if len(sample) > DEBUG_MAX_SAMPLE_CHARS:
-                    sample = sample[:DEBUG_MAX_SAMPLE_CHARS] + "…"
-                log(f"[debug] sample card text {i}: {sample}")
-
-        # Parse listings
+        # Parse listing blocks
         for t in texts:
-            if len(t) > 7000:
-                continue
-
             qty = extract_qty(t)
             section, row, price, fees = extract_section_row_price_fees(t)
             score = extract_value_score(t)
             deal_label = extract_deal_label(t)
 
-            # Identify plausible listing blocks
-            plausible = (section != "Unknown") or (price != "Unknown") or (qty > 0)
-            if not plausible:
+            # basic plausibility
+            if section == "Unknown" and price == "Unknown" and qty == 0:
                 continue
 
             listings.append(
@@ -373,8 +396,7 @@ def scrape_listings(event_url: str) -> List[Listing]:
                 )
             )
 
-        # Optional: dump html if we parsed zero listings but extracted text exists
-        if len(listings) == 0 and len(texts) > 0 and DEBUG_DUMP_HTML_ON_EMPTY:
+        if len(listings) == 0 and DEBUG_DUMP_HTML_ON_FAILURE:
             html2 = page.content()
             write_debug_file("/tmp/stubhub_debug_zero_listings.html", html2[:2_000_000])
 
@@ -387,15 +409,18 @@ def scrape_listings(event_url: str) -> List[Listing]:
 # =========================
 
 def qualifies(l: Listing) -> bool:
-    # quantity constraint
+    # enforce minimum tickets
     if l.qty and l.qty < MIN_TICKETS:
         return False
+
     # numeric score path
     if l.value_score is not None:
         return l.value_score >= MIN_VALUE_SCORE
-    # label fallback (optional)
+
+    # optional label fallback
     if DEAL_LABELS_TRIGGER and l.deal_label:
         return l.deal_label.strip().lower() in DEAL_LABELS_TRIGGER
+
     return False
 
 def price_num(l: Listing) -> float:
@@ -433,7 +458,7 @@ def main() -> None:
     start_heartbeat()
 
     if not EVENT_URL:
-        log("[fatal] STUBHUB_EVENT_URL is not set. Set it in Railway Variables. Sleeping indefinitely.")
+        log("[fatal] STUBHUB_EVENT_URL not set. Configure Railway Variable STUBHUB_EVENT_URL. Sleeping indefinitely.")
         while True:
             time.sleep(60)
 
@@ -443,11 +468,14 @@ def main() -> None:
     while True:
         try:
             listings = scrape_listings(EVENT_URL)
-            qualifying = [l for l in listings if qualifies(l)]
 
-            log(f"[cycle] scraped={len(listings)} qualifying={len(qualifying)} at {time.ctime()}")
+            # Filter for minimum tickets first (more deterministic)
+            listings_qty = [l for l in listings if (l.qty == 0 or l.qty >= MIN_TICKETS)]
+            qualifying = [l for l in listings_qty if qualifies(l)]
 
-            # New alerts
+            log(f"[cycle] scraped={len(listings)} qty_ok={len(listings_qty)} qualifying={len(qualifying)} at {time.ctime()}")
+
+            # NEW alerts
             new_hits: List[Tuple[str, Listing]] = []
             for l in qualifying:
                 fp = listing_fingerprint(l)
@@ -470,7 +498,7 @@ def main() -> None:
             else:
                 log("[alert] no new qualifying listings")
 
-            # Digest snapshot
+            # DIGEST snapshot
             now = time.time()
             if (now - last_digest_ts) >= DIGEST_INTERVAL_SECONDS:
                 last_digest_ts = now
@@ -484,8 +512,7 @@ def main() -> None:
                 if top_n:
                     lines = [format_listing(l) for l in top_n]
                     msg = (
-                        f"CUMULATIVE snapshot (top {len(top_n)}) "
-                        f"(qty≥{MIN_TICKETS}, score≥{MIN_VALUE_SCORE}):\n"
+                        f"CUMULATIVE snapshot (top {len(top_n)}) (qty≥{MIN_TICKETS}, score≥{MIN_VALUE_SCORE}):\n"
                         + "\n".join(lines)
                         + f"\n\nTotal qualifying visible now: {len(qualifying_sorted)}"
                         + f"\nEvent: {EVENT_URL}"
