@@ -12,14 +12,15 @@ from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
+EVENT_URL = os.getenv("STUBHUB_EVENT_URL", "").strip()
+MIN_VALUE_SCORE = float(os.getenv("MIN_VALUE_SCORE", "9.5"))
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+
 print("Bot starting up...")
 print(f"EVENT_URL set? {'YES' if bool(EVENT_URL) else 'NO'}")
 print(f"MIN_VALUE_SCORE={MIN_VALUE_SCORE}")
 print(f"CHECK_INTERVAL_SECONDS={CHECK_INTERVAL_SECONDS}")
 
-EVENT_URL = os.getenv("STUBHUB_EVENT_URL", "").strip()
-MIN_VALUE_SCORE = float(os.getenv("MIN_VALUE_SCORE", "9.5"))
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 
 # Alerts via Pushover (recommended). If not set, prints to logs.
 PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY", "").strip()
