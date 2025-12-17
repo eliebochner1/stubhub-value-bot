@@ -5,7 +5,7 @@ import json
 import hashlib
 import threading
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import requests
 from dotenv import load_dotenv
@@ -99,9 +99,28 @@ def save_seen(seen: set) -> None:
     except Exception as e:
         log(f"[warn] failed to save state file: {e}")
 
+def listing_key(l: Listing) -> Tuple:
+    """Stable key to dedupe duplicates caused by repeated DOM nodes / virtualization."""
+    return (l.section, l.row, l.qty, l.price_incl_fees, l.value_score, l.rating_word)
+
 def listing_fingerprint(l: Listing) -> str:
-    raw = f"{l.section}|{l.row}|{l.qty}|{l.price_incl_fees}|{l.value_score}|{l.rating_word}|{l.url}"
+    """
+    Fingerprint should be stable across repeated DOM nodes.
+    Keep it tight so identical listings do not create multiple alerts.
+    """
+    raw = f"{l.section}|{l.row}|{l.qty}|{l.price_incl_fees}|{l.value_score}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def dedupe_listings(listings: List[Listing]) -> List[Listing]:
+    seen = set()
+    out: List[Listing] = []
+    for l in listings:
+        k = listing_key(l)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(l)
+    return out
 
 
 # =========================
@@ -128,8 +147,14 @@ def pushover_notify(title: str, message: str) -> None:
 # =========================
 
 def split_into_listing_chunks(block_text: str) -> List[str]:
+    """
+    Some DOM nodes contain multiple listings concatenated. Split on each "Section X" boundary.
+    """
     t = normalize_spaces(block_text)
+
+    # Trim footer-ish markers if present
     t = re.split(r"\bShowing\s+\d+\s+of\s+\d+\b", t, maxsplit=1)[0].strip()
+
     parts = re.split(r"(?=\bSection\s+[A-Za-z0-9]+\b)", t)
     chunks = [p.strip() for p in parts if p.strip().lower().startswith("section ")]
     return chunks
@@ -164,7 +189,7 @@ def extract_price_incl_fees(chunk: str) -> str:
     return "Unknown"
 
 def extract_score_and_word(chunk: str) -> Tuple[Optional[float], Optional[str]]:
-    # format: "... $36 incl. fees 9.9 Amazing"
+    # Format observed: "... $36 incl. fees 9.9 Amazing"
     m = re.search(r"\b(\d{1,2}\.\d)\s+([A-Za-z]+)\b", chunk)
     if not m:
         return None, None
@@ -214,7 +239,6 @@ def try_click_consent(page) -> None:
             pass
 
 def try_click_show_more(page) -> None:
-    # best-effort; not fatal if missing
     try:
         btn = page.get_by_role("button", name=re.compile(r"show more", re.I))
         if btn.count() > 0:
@@ -232,7 +256,6 @@ def scroll_aggressively(page) -> None:
     page.wait_for_timeout(900)
 
 def wait_for_results_hint(page) -> None:
-    # Wait for either the View N Listings anchor or at least some "Section" tokens
     try:
         page.wait_for_selector("text=/View\\s+\\d+\\s+Listings/i", timeout=8000)
     except Exception:
@@ -243,7 +266,6 @@ def find_results_root(page):
     if anchor.count() == 0:
         return None
 
-    # Climb to an ancestor that contains many Section tokens (likely the results list region)
     for depth in range(1, 10):
         try:
             cand = anchor.locator(f"xpath=ancestor::*[{depth}]")
@@ -259,10 +281,6 @@ def find_results_root(page):
     return fallback if fallback.count() > 0 else None
 
 def extract_blocks_from_root(root, max_blocks=250) -> List[str]:
-    """
-    Extract DOM nodes likely to contain listing rows.
-    We deliberately include 'tickets together' since it appears in your listing text.
-    """
     candidates = root.locator("div, li").filter(has_text=re.compile(r"\bSection\b", re.I))
     total = candidates.count()
     log(f"[debug] candidates_in_root={total}")
@@ -276,9 +294,7 @@ def extract_blocks_from_root(root, max_blocks=250) -> List[str]:
                 continue
             low = t.lower()
 
-            # gates for listing-like material
             if ("section" in low and "row" in low and "$" in t and "ticket" in low):
-                # exclude filter panel
                 if "number of tickets" in low and "reset filters" in low:
                     continue
                 texts.append(t)
@@ -289,10 +305,6 @@ def extract_blocks_from_root(root, max_blocks=250) -> List[str]:
     return texts
 
 def extract_blocks_global(page, max_nodes=250) -> List[str]:
-    """
-    Root-independent fallback if root is wrong or results aren't mounted where expected.
-    Searches the entire page for nodes that look like listing rows.
-    """
     xpath = "//*[contains(., 'Section') and contains(., 'Row') and contains(., '$') and contains(., 'tickets')]"
     loc = page.locator(f"xpath={xpath}")
     total = loc.count()
@@ -345,7 +357,7 @@ def scrape_listings(event_url: str) -> List[Listing]:
             log("[debug] title -> (unavailable)")
         log(f"[debug] final url -> {redact_url(page.url)}")
 
-        # PASS 1: wait + consent + scroll + show more
+        # PASS 1
         wait_for_results_hint(page)
         try_click_consent(page)
         scroll_aggressively(page)
@@ -359,7 +371,7 @@ def scrape_listings(event_url: str) -> List[Listing]:
             log(f"[debug] root SectionTokens={sec_tokens}")
             blocks = extract_blocks_from_root(root, max_blocks=250)
 
-        # If empty, retry once more with extra wait/scroll and then global fallback
+        # PASS 2
         if len(blocks) == 0:
             log("[warn] root extraction returned 0 blocks; retrying after extra wait/scroll.")
             page.wait_for_timeout(2500)
@@ -373,6 +385,7 @@ def scrape_listings(event_url: str) -> List[Listing]:
                 log(f"[debug] retry root SectionTokens={sec_tokens2}")
                 blocks = extract_blocks_from_root(root2, max_blocks=400)
 
+        # GLOBAL fallback
         if len(blocks) == 0:
             log("[warn] root-based extraction still 0; using GLOBAL fallback extraction.")
             blocks = extract_blocks_global(page, max_nodes=300)
@@ -411,11 +424,16 @@ def scrape_listings(event_url: str) -> List[Listing]:
 
         browser.close()
 
+    # DEDUPE (critical to prevent repeated alerts for same listing)
+    before = len(listings)
+    listings = dedupe_listings(listings)
+    log(f"[debug] listings deduped -> {before} -> {len(listings)}")
+
     return listings
 
 
 # =========================
-# Heartbeat + main loop
+# Heartbeat + main
 # =========================
 
 def start_heartbeat() -> None:
@@ -452,15 +470,27 @@ def main() -> None:
 
             log(f"[cycle] parsed_listings={len(listings)} qty_ok={len(qty_ok)} qualifying={len(qualifying)} at {time.ctime()}")
 
-            # NEW alerts
-            new_hits: List[Tuple[str, Listing]] = []
+            # NEW alerts (dedupe again defensively)
+            raw_new_hits: List[Tuple[str, Listing]] = []
             for l in qualifying:
                 fp = listing_fingerprint(l)
                 if fp not in seen:
-                    new_hits.append((fp, l))
+                    raw_new_hits.append((fp, l))
 
-            if new_hits:
-                new_hits_sorted = sorted(new_hits, key=lambda x: (-(x[1].value_score or 0.0), price_num(x[1].price_incl_fees)))
+            # Deduplicate new hits by stable listing key
+            dedup: Dict[Tuple, Tuple[str, Listing]] = {}
+            for fp, l in raw_new_hits:
+                k = listing_key(l)
+                if k not in dedup:
+                    dedup[k] = (fp, l)
+
+            new_hits_unique = list(dedup.values())
+
+            if new_hits_unique:
+                new_hits_sorted = sorted(
+                    new_hits_unique,
+                    key=lambda x: (-(x[1].value_score or 0.0), price_num(x[1].price_incl_fees)),
+                )
                 lines = [format_listing(l) for _, l in new_hits_sorted[:12]]
                 msg = (
                     f"NEW qualifying listings (qty≥{MIN_TICKETS}, score≥{MIN_VALUE_SCORE}):\n"
@@ -469,10 +499,10 @@ def main() -> None:
                 )
                 pushover_notify("NEW StubHub listings", msg)
 
-                for fp, _ in new_hits:
+                for fp, _ in new_hits_unique:
                     seen.add(fp)
                 save_seen(seen)
-                log(f"[alert] new alerts sent={len(new_hits)}")
+                log(f"[alert] new alerts sent={len(new_hits_unique)}")
             else:
                 log("[alert] no new qualifying listings")
 
@@ -480,7 +510,10 @@ def main() -> None:
             now = time.time()
             if (now - last_digest_ts) >= DIGEST_INTERVAL_SECONDS:
                 last_digest_ts = now
-                qualifying_sorted = sorted(qualifying, key=lambda l: (-(l.value_score or 0.0), price_num(l.price_incl_fees)))
+                qualifying_sorted = sorted(
+                    qualifying,
+                    key=lambda l: (-(l.value_score or 0.0), price_num(l.price_incl_fees)),
+                )
                 top_n = qualifying_sorted[:DIGEST_TOP_N]
 
                 if top_n:
