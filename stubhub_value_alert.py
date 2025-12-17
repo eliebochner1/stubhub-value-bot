@@ -22,6 +22,14 @@ print(f"MIN_VALUE_SCORE={MIN_VALUE_SCORE}")
 print(f"CHECK_INTERVAL_SECONDS={CHECK_INTERVAL_SECONDS}")
 
 
+# Temporary heartbeat for debugging (remove later)
+import threading
+def heartbeat():
+    while True:
+        print("heartbeat: process alive", flush=True)
+        time.sleep(10)
+threading.Thread(target=heartbeat, daemon=True).start()
+
 # Alerts via Pushover (recommended). If not set, prints to logs.
 PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY", "").strip()
 PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN", "").strip()
