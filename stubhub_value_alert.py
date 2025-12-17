@@ -16,6 +16,9 @@ EVENT_URL = os.getenv("STUBHUB_EVENT_URL", "").strip()
 MIN_VALUE_SCORE = float(os.getenv("MIN_VALUE_SCORE", "9.5"))
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 
+DIGEST_INTERVAL_SECONDS = int(os.getenv("DIGEST_INTERVAL_SECONDS", "3600"))  # 1 hour
+DIGEST_TOP_N = int(os.getenv("DIGEST_TOP_N", "15"))
+
 print("Bot starting up...")
 print(f"EVENT_URL set? {'YES' if bool(EVENT_URL) else 'NO'}")
 print(f"MIN_VALUE_SCORE={MIN_VALUE_SCORE}")
@@ -179,6 +182,10 @@ def scrape_listings(event_url: str) -> List[Listing]:
 
     return listings
 
+def format_listing_line(l: Listing) -> str:
+    score = f"{l.value_score:.1f}" if l.value_score is not None else "NA"
+    base = f"Score {score} | {l.section}/{l.row} | Qty {l.qty} | {l.price}"
+    return base + (f" | {l.fees_or_all_in}" if l.fees_or_all_in else "")
 
 def main():
     if not EVENT_URL:
@@ -186,39 +193,68 @@ def main():
 
     seen = load_seen()
 
-    while True:
-        try:
-            listings = scrape_listings(EVENT_URL)
+last_digest_ts = 0.0
 
-            new_hits = []
-            for l in listings:
-                if l.value_score is None:
-                    continue
-                if l.value_score >= MIN_VALUE_SCORE:
-                    fp = listing_fingerprint(l)
-                    if fp not in seen:
-                        new_hits.append((fp, l))
+while True:
+    try:
+        listings = scrape_listings(EVENT_URL)
 
-            if new_hits:
-                lines = []
-                for _, l in new_hits[:12]:
-                    lines.append(
-                        f"Score {l.value_score:.1f} | {l.section}/{l.row} | Qty {l.qty} | {l.price}"
-                        + (f" | {l.fees_or_all_in}" if l.fees_or_all_in else "")
-                    )
-                msg = "\n".join(lines) + f"\n\nEvent: {EVENT_URL}"
-                pushover_notify(f"StubHub Value ≥ {MIN_VALUE_SCORE}", msg)
+        # Filter to only listings that meet the threshold
+        qualifying = [l for l in listings if l.value_score is not None and l.value_score >= MIN_VALUE_SCORE]
 
-                for fp, _ in new_hits:
-                    seen.add(fp)
-                save_seen(seen)
+        # NEW listings (not previously alerted)
+        new_hits = []
+        for l in qualifying:
+            fp = listing_fingerprint(l)
+            if fp not in seen:
+                new_hits.append((fp, l))
+
+        # 1) Immediate alert for NEW qualifying listings
+        if new_hits:
+            lines = [format_listing_line(l) for _, l in new_hits[:12]]
+            msg = "NEW qualifying listings:\n" + "\n".join(lines) + f"\n\nEvent: {EVENT_URL}"
+            pushover_notify(f"NEW StubHub Value ≥ {MIN_VALUE_SCORE}", msg)
+
+            for fp, _ in new_hits:
+                seen.add(fp)
+            save_seen(seen)
+        else:
+            print(f"No new listings ≥ {MIN_VALUE_SCORE} at {time.ctime()}", flush=True)
+
+        # 2) Periodic DIGEST for CUMULATIVE qualifying listings (snapshot)
+        now = time.time()
+        if (now - last_digest_ts) >= DIGEST_INTERVAL_SECONDS:
+            last_digest_ts = now
+
+            # Sort best scores first, then (roughly) by lowest price if present
+            def price_num(l: Listing) -> float:
+                if not l.price:
+                    return 1e18
+                m = re.sub(r"[^\d.]", "", l.price)
+                return float(m) if m else 1e18
+
+            qualifying_sorted = sorted(
+                qualifying,
+                key=lambda l: (-(l.value_score or 0.0), price_num(l)),
+            )
+
+            if qualifying_sorted:
+                lines = [format_listing_line(l) for l in qualifying_sorted[:DIGEST_TOP_N]]
+                msg = (
+                    f"CUMULATIVE snapshot (top {min(DIGEST_TOP_N, len(qualifying_sorted))}):\n"
+                    + "\n".join(lines)
+                    + f"\n\nTotal qualifying visible now: {len(qualifying_sorted)}"
+                    + f"\nEvent: {EVENT_URL}"
+                )
             else:
-                print(f"No new listings ≥ {MIN_VALUE_SCORE} at {time.ctime()}")
+                msg = f"CUMULATIVE snapshot: no listings ≥ {MIN_VALUE_SCORE} visible now.\nEvent: {EVENT_URL}"
 
-        except Exception as e:
-            print(f"Error: {e}")
+            pushover_notify(f"DIGEST StubHub Value ≥ {MIN_VALUE_SCORE}", msg)
 
-        time.sleep(CHECK_INTERVAL_SECONDS)
+    except Exception as e:
+        print(f"Error: {e}", flush=True)
+
+    time.sleep(CHECK_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
