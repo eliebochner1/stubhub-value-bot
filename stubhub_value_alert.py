@@ -39,13 +39,6 @@ def summarize_for_log(t: str, max_chars: int) -> str:
     s = normalize_spaces(t)
     return (s[:max_chars] + "…") if len(s) > max_chars else s
 
-def value_sort_key(l: Listing):
-    return (
-        -(l.value_score or 0.0),      # highest score first
-        price_num(l.price_incl_fees), # cheaper first
-        l.section,
-        l.row,
-    )
 
 # =========================
 # Config
@@ -107,13 +100,11 @@ def save_seen(seen: set) -> None:
         log(f"[warn] failed to save state file: {e}")
 
 def listing_key(l: Listing) -> Tuple:
-    """Stable key to dedupe duplicates caused by repeated DOM nodes / virtualization."""
     return (l.section, l.row, l.qty, l.price_incl_fees, l.value_score, l.rating_word)
 
 def listing_fingerprint(l: Listing) -> str:
     """
-    Fingerprint should be stable across repeated DOM nodes.
-    Keep it tight so identical listings do not create multiple alerts.
+    Stable fingerprint across duplicated DOM nodes.
     """
     raw = f"{l.section}|{l.row}|{l.qty}|{l.price_incl_fees}|{l.value_score}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -158,13 +149,9 @@ def split_into_listing_chunks(block_text: str) -> List[str]:
     Some DOM nodes contain multiple listings concatenated. Split on each "Section X" boundary.
     """
     t = normalize_spaces(block_text)
-
-    # Trim footer-ish markers if present
     t = re.split(r"\bShowing\s+\d+\s+of\s+\d+\b", t, maxsplit=1)[0].strip()
-
     parts = re.split(r"(?=\bSection\s+[A-Za-z0-9]+\b)", t)
-    chunks = [p.strip() for p in parts if p.strip().lower().startswith("section ")]
-    return chunks
+    return [p.strip() for p in parts if p.strip().lower().startswith("section ")]
 
 def extract_qty(chunk: str) -> int:
     m = re.search(r"(\d+)\s+tickets?", chunk, re.IGNORECASE)
@@ -196,7 +183,7 @@ def extract_price_incl_fees(chunk: str) -> str:
     return "Unknown"
 
 def extract_score_and_word(chunk: str) -> Tuple[Optional[float], Optional[str]]:
-    # Format observed: "... $36 incl. fees 9.9 Amazing"
+    # Observed format: "... $36 incl. fees 9.9 Amazing"
     m = re.search(r"\b(\d{1,2}\.\d)\s+([A-Za-z]+)\b", chunk)
     if not m:
         return None, None
@@ -218,6 +205,13 @@ def price_num(price_incl: str) -> float:
         return float(m) if m else 1e18
     except Exception:
         return 1e18
+
+def value_sort_key(l: Listing) -> Tuple:
+    """
+    Highest value first, then cheapest, then stable tie-breakers.
+    Safe even if value_score is None.
+    """
+    return (-(l.value_score or 0.0), price_num(l.price_incl_fees), l.section or "", l.row or "")
 
 def format_listing(l: Listing) -> str:
     score = f"{l.value_score:.1f}" if l.value_score is not None else "NA"
@@ -300,7 +294,6 @@ def extract_blocks_from_root(root, max_blocks=250) -> List[str]:
             if not t:
                 continue
             low = t.lower()
-
             if ("section" in low and "row" in low and "$" in t and "ticket" in low):
                 if "number of tickets" in low and "reset filters" in low:
                     continue
@@ -414,6 +407,7 @@ def scrape_listings(event_url: str) -> List[Listing]:
                 price = extract_price_incl_fees(c)
                 score, word = extract_score_and_word(c)
 
+                # plausibility
                 if section == "Unknown" and row == "Unknown" and price == "Unknown":
                     continue
 
@@ -431,13 +425,18 @@ def scrape_listings(event_url: str) -> List[Listing]:
 
         browser.close()
 
-    # DEDUPE (critical to prevent repeated alerts for same listing)
+    # DEDUPE
     before = len(listings)
     listings = dedupe_listings(listings)
-    listings.sort(key=value_sort_key)
+
+    # SORT BY VALUE (highest value first)
+    try:
+        listings.sort(key=value_sort_key)
+    except Exception as e:
+        # Sorting should never crash the bot
+        log(f"[warn] sort failed: {e}")
 
     log(f"[debug] listings deduped -> {before} -> {len(listings)}")
-
     return listings
 
 
@@ -474,11 +473,13 @@ def main() -> None:
     while True:
         try:
             listings = scrape_listings(EVENT_URL)
+
+            # Enforce qty >= MIN_TICKETS (if qty parsed as 0, keep it but it will not qualify)
             qty_ok = [l for l in listings if (l.qty == 0 or l.qty >= MIN_TICKETS)]
-            qualifying = sorted(
-                (l for l in qty_ok if qualifies(l)),
-                key=value_sort_key
-            )
+
+            # QUALIFY + SORT (highest value definitely shown first)
+            qualifying = [l for l in qty_ok if qualifies(l)]
+            qualifying.sort(key=value_sort_key)
 
             log(f"[cycle] parsed_listings={len(listings)} qty_ok={len(qty_ok)} qualifying={len(qualifying)} at {time.ctime()}")
 
@@ -497,13 +498,10 @@ def main() -> None:
                     dedup[k] = (fp, l)
 
             new_hits_unique = list(dedup.values())
+            new_hits_unique.sort(key=lambda x: value_sort_key(x[1]))
 
             if new_hits_unique:
-                new_hits_sorted = sorted(
-                    new_hits_unique,
-                    key=lambda x: value_sort_key(x[1])
-)
-                    lines = [format_listing(l) for _, l in new_hits_sorted[:12]]
+                lines = [format_listing(l) for _, l in new_hits_unique[:12]]
                 msg = (
                     f"NEW qualifying listings (qty≥{MIN_TICKETS}, score≥{MIN_VALUE_SCORE}):\n"
                     + "\n".join(lines)
@@ -518,22 +516,18 @@ def main() -> None:
             else:
                 log("[alert] no new qualifying listings")
 
-            # DIGEST snapshot
+            # DIGEST snapshot (already sorted by value)
             now = time.time()
             if (now - last_digest_ts) >= DIGEST_INTERVAL_SECONDS:
                 last_digest_ts = now
-                qualifying_sorted = sorted(
-                    qualifying,
-                    key=lambda l: (-(l.value_score or 0.0), price_num(l.price_incl_fees)),
-                )
-                top_n = qualifying_sorted[:DIGEST_TOP_N]
 
+                top_n = qualifying[:DIGEST_TOP_N]
                 if top_n:
                     lines = [format_listing(l) for l in top_n]
                     msg = (
                         f"CUMULATIVE snapshot (top {len(top_n)}) (qty≥{MIN_TICKETS}, score≥{MIN_VALUE_SCORE}):\n"
                         + "\n".join(lines)
-                        + f"\n\nTotal qualifying visible now: {len(qualifying_sorted)}"
+                        + f"\n\nTotal qualifying visible now: {len(qualifying)}"
                         + f"\nEvent: {EVENT_URL}"
                     )
                 else:
@@ -547,7 +541,8 @@ def main() -> None:
                 log("[digest] sent")
 
         except Exception as e:
-            log(f"[error] cycle exception: {e}")
+            # Make crashes obvious in logs
+            log(f"[error] cycle exception: {type(e).__name__}: {e}")
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
