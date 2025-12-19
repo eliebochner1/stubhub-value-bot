@@ -39,6 +39,13 @@ def summarize_for_log(t: str, max_chars: int) -> str:
     s = normalize_spaces(t)
     return (s[:max_chars] + "…") if len(s) > max_chars else s
 
+def value_sort_key(l: Listing):
+    return (
+        -(l.value_score or 0.0),      # highest score first
+        price_num(l.price_incl_fees), # cheaper first
+        l.section,
+        l.row,
+    )
 
 # =========================
 # Config
@@ -427,6 +434,8 @@ def scrape_listings(event_url: str) -> List[Listing]:
     # DEDUPE (critical to prevent repeated alerts for same listing)
     before = len(listings)
     listings = dedupe_listings(listings)
+    listings.sort(key=value_sort_key)
+
     log(f"[debug] listings deduped -> {before} -> {len(listings)}")
 
     return listings
@@ -466,7 +475,10 @@ def main() -> None:
         try:
             listings = scrape_listings(EVENT_URL)
             qty_ok = [l for l in listings if (l.qty == 0 or l.qty >= MIN_TICKETS)]
-            qualifying = [l for l in qty_ok if qualifies(l)]
+            qualifying = sorted(
+                (l for l in qty_ok if qualifies(l)),
+                key=value_sort_key
+            )
 
             log(f"[cycle] parsed_listings={len(listings)} qty_ok={len(qty_ok)} qualifying={len(qualifying)} at {time.ctime()}")
 
@@ -489,9 +501,9 @@ def main() -> None:
             if new_hits_unique:
                 new_hits_sorted = sorted(
                     new_hits_unique,
-                    key=lambda x: (-(x[1].value_score or 0.0), price_num(x[1].price_incl_fees)),
-                )
-                lines = [format_listing(l) for _, l in new_hits_sorted[:12]]
+                    key=lambda x: value_sort_key(x[1])
+)
+                    lines = [format_listing(l) for _, l in new_hits_sorted[:12]]
                 msg = (
                     f"NEW qualifying listings (qty≥{MIN_TICKETS}, score≥{MIN_VALUE_SCORE}):\n"
                     + "\n".join(lines)
